@@ -2658,6 +2658,11 @@ int sqlite3BtreeOpen(
       sqlite3_mutex_leave(mutexShared);
     }
 #endif
+
+    if ((pVfs->xAllocatePage && !pVfs->xFreePage) || (pVfs->xFreePage && !pVfs->xAllocatePage)) {
+      rc = SQLITE_MISUSE;
+      goto btree_open_out;
+    }
   }
 
 #if !defined(SQLITE_OMIT_SHARED_CACHE) && !defined(SQLITE_OMIT_DISKIO)
@@ -6242,7 +6247,7 @@ int sqlite3BtreePrevious(BtCursor *pCur, int flags){
 ** to nearby if any such page exists.  If eMode is BTALLOC_ANY then there
 ** are no restrictions on which page is returned.
 */
-static int allocateBtreePage(
+static int allocateBtreePageDefaultImpl(
   BtShared *pBt,         /* The btree */
   MemPage **ppPage,      /* Store pointer to the allocated page here */
   Pgno *pPgno,           /* Store the page number here */
@@ -6552,6 +6557,28 @@ end_allocate_page:
   return rc;
 }
 
+static int allocateBtreePage(
+  BtShared *pBt,         /* The btree */
+  MemPage **ppPage,      /* Store pointer to the allocated page here */
+  Pgno *pPgno,           /* Store the page number here */
+  Pgno nearby,           /* Search for a page near this one */
+  u8 eMode               /* BTALLOC_EXACT, BTALLOC_LT, or BTALLOC_ANY */
+){
+  if (pBt->pPager->pVfs->xAllocatePage) {
+    int rc = pBt->pPager->pVfs->xAllocatePage(pBt->pPager->fd, pPgno, eMode);
+    if (rc) return rc;
+    rc = btreeGetUnusedPage(pBt, *pPgno, ppPage, 0);
+    if (rc) return rc;
+    rc = sqlite3PagerWrite((*ppPage)->pDbPage);
+    releasePage(*ppPage);
+    if( rc!=SQLITE_OK ){
+      *ppPage = 0;
+      return rc;
+    }
+  }
+  return allocateBtreePageDefaultImpl(pBt, ppPage, pPgno, nearby, eMode);
+}
+
 /*
 ** This function is used to add page iPage to the database file free-list. 
 ** It is assumed that the page is not already a part of the free-list.
@@ -6564,7 +6591,7 @@ end_allocate_page:
 ** If a pointer to a MemPage object is passed as the second argument,
 ** its reference count is not altered by this function.
 */
-static int freePage2(BtShared *pBt, MemPage *pMemPage, Pgno iPage){
+static int freePageDefaultImpl(BtShared *pBt, MemPage *pMemPage, Pgno iPage){
   MemPage *pTrunk = 0;                /* Free-list trunk page */
   Pgno iTrunk = 0;                    /* Page number of free-list trunk page */ 
   MemPage *pPage1 = pBt->pPage1;      /* Local reference to page 1 */
@@ -6698,6 +6725,14 @@ freepage_out:
   releasePage(pTrunk);
   return rc;
 }
+
+static int freePage2(BtShared *pBt, MemPage *pMemPage, Pgno iPage){
+  if (pBt->pPager->pVfs->xFreePage) {
+    return pBt->pPager->pVfs->xFreePage(pBt->pPager->fd, iPage);
+  }
+  return freePageDefaultImpl(pBt, pMemPage, iPage);
+}
+
 static void freePage(MemPage *pPage, int *pRC){
   if( (*pRC)==SQLITE_OK ){
     *pRC = freePage2(pPage->pBt, pPage, pPage->pgno);
@@ -10760,6 +10795,8 @@ char *sqlite3BtreeIntegrityCheck(
   if( i<=sCheck.nPage ) setPageReferenced(&sCheck, i);
 
   /* Check the integrity of the freelist
+  *  libSQL: makes no sense if xAllocatePage is used, but does no harm,
+  *  and instead just reports that there are no free pages
   */
   if( bCkFreelist ){
     sCheck.zPfx = "Main freelist: ";
